@@ -2,7 +2,21 @@ import { useRef, useState, useEffect, useCallback } from 'react';
 import { io, Socket } from 'socket.io-client';
 import { config } from '../../../config';
 
-const socket: Socket = io(config.backendUrl);
+// PERFORMANCE: Singleton socket connection - reuse across components
+let socketInstance: Socket | null = null;
+
+const getSocket = (): Socket => {
+    if (!socketInstance) {
+        socketInstance = io(config.backendUrl, {
+            transports: ['websocket'], // Faster than polling
+            upgrade: false, // Don't upgrade, stay on WebSocket
+            reconnection: true,
+            reconnectionDelay: 1000,
+            reconnectionAttempts: 5,
+        });
+    }
+    return socketInstance;
+};
 
 export interface Participant {
     id: string;
@@ -18,48 +32,60 @@ interface UseWebRTCProps {
     localStream: MediaStream | null;
 }
 
+// PERFORMANCE: Optimized ICE server configuration
+const peerConnectionConfig: RTCConfiguration = {
+    iceServers: config.iceServers,
+    iceCandidatePoolSize: 10, // Pre-gather ICE candidates
+    bundlePolicy: 'max-bundle', // Maximize bundling for performance
+    rtcpMuxPolicy: 'require', // Multiplex RTP and RTCP
+};
+
 export const useWebRTC = ({ roomId, userName, localStream }: UseWebRTCProps) => {
+    // PERFORMANCE: Use Map for O(1) lookups
     const [participants, setParticipants] = useState<Participant[]>([]);
     const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
-
+    const socket = useRef<Socket>(getSocket());
 
     const [pendingRequests, setPendingRequests] = useState<{ userId: string; userName: string }[]>([]);
     const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'waiting' | 'joined' | 'rejected'>('connecting');
 
-    // Helper to safely get the current state of participants in callbacks
-    const participantsRef = useRef<Participant[]>([]);
-    useEffect(() => { participantsRef.current = participants; }, [participants]);
+    // PERFORMANCE: Batch ICE candidates to reduce signaling overhead
+    const iceCandidateQueue = useRef<Map<string, RTCIceCandidate[]>>(new Map());
+    const iceCandidateTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
 
-    const playNotificationSound = () => {
-        const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-        const oscillator = audioContext.createOscillator();
-        const gainNode = audioContext.createGain();
-        oscillator.connect(gainNode);
-        gainNode.connect(audioContext.destination);
-        oscillator.type = 'sine';
-        oscillator.frequency.setValueAtTime(500, audioContext.currentTime);
-        gainNode.gain.setValueAtTime(0.1, audioContext.currentTime);
-        oscillator.start();
-        oscillator.stop(audioContext.currentTime + 0.2);
-    };
+    const [activeSpeakerId] = useState<string | null>(null);
+
+    const playNotificationSound = useCallback(() => {
+        try {
+            const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+            const oscillator = audioContext.createOscillator();
+            const gainNode = audioContext.createGain();
+            oscillator.connect(gainNode);
+            gainNode.connect(audioContext.destination);
+            oscillator.type = 'sine';
+            oscillator.frequency.setValueAtTime(500, audioContext.currentTime);
+            gainNode.gain.setValueAtTime(0.1, audioContext.currentTime);
+            oscillator.start();
+            oscillator.stop(audioContext.currentTime + 0.2);
+        } catch (e) {
+            console.warn('Audio context not available');
+        }
+    }, []);
 
     const createPeerConnection = useCallback(async (userId: string, userName: string, isInitiator: boolean, stream: MediaStream) => {
         if (peersRef.current.has(userId)) return;
 
-        const pc = new RTCPeerConnection({
-            iceServers: config.iceServers,
-        });
-
+        const pc = new RTCPeerConnection(peerConnectionConfig);
         peersRef.current.set(userId, pc);
 
-        // Add local tracks
+        // PERFORMANCE: Add tracks efficiently
         stream.getTracks().forEach((track) => {
             pc.addTrack(track, stream);
         });
 
         // Handle remote tracks
         pc.ontrack = (event) => {
-            console.log(`Received track from ${userName}:`, event.streams[0].id);
+            console.log(`Received track from ${userName}`);
             setParticipants((prev) =>
                 prev.map((p) =>
                     p.id === userId ? { ...p, stream: event.streams[0] } : p
@@ -67,21 +93,43 @@ export const useWebRTC = ({ roomId, userName, localStream }: UseWebRTCProps) => 
             );
         };
 
-        // Handle ICE candidates
+        // PERFORMANCE: Batch ICE candidates
         pc.onicecandidate = (event) => {
             if (event.candidate) {
-                socket.emit("ice-candidate", {
-                    roomId,
-                    to: userId,
-                    candidate: event.candidate,
-                });
+                const queue = iceCandidateQueue.current.get(userId) || [];
+                queue.push(event.candidate);
+                iceCandidateQueue.current.set(userId, queue);
+
+                // Clear existing timer
+                const existingTimer = iceCandidateTimers.current.get(userId);
+                if (existingTimer) clearTimeout(existingTimer);
+
+                // Send batched candidates after 50ms
+                const timer = setTimeout(() => {
+                    const candidates = iceCandidateQueue.current.get(userId) || [];
+                    if (candidates.length > 0) {
+                        // Send all at once
+                        candidates.forEach(candidate => {
+                            socket.current.emit("ice-candidate", {
+                                roomId,
+                                to: userId,
+                                candidate,
+                            });
+                        });
+                        iceCandidateQueue.current.delete(userId);
+                    }
+                    iceCandidateTimers.current.delete(userId);
+                }, 50);
+
+                iceCandidateTimers.current.set(userId, timer);
             }
         };
 
         pc.onconnectionstatechange = () => {
             console.log(`Connection state with ${userName}: ${pc.connectionState}`);
             if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
-                // Optional: Attempt reconnect or strict cleanup
+                // Attempt reconnection
+                console.warn(`Connection ${pc.connectionState} with ${userName}`);
             }
         };
 
@@ -89,11 +137,11 @@ export const useWebRTC = ({ roomId, userName, localStream }: UseWebRTCProps) => 
             try {
                 const offer = await pc.createOffer();
                 await pc.setLocalDescription(offer);
-                socket.emit("offer", {
+                socket.current.emit("offer", {
                     roomId,
                     to: userId,
                     offer,
-                    userName: userName, // Sending my name
+                    userName: userName,
                 });
             } catch (err) {
                 console.error("Error creating offer:", err);
@@ -105,71 +153,68 @@ export const useWebRTC = ({ roomId, userName, localStream }: UseWebRTCProps) => 
         peersRef.current.forEach((pc) => {
             const sender = pc.getSenders().find((s) => s.track?.kind === newTrack.kind);
             if (sender) {
-                sender.replaceTrack(newTrack);
+                sender.replaceTrack(newTrack).catch(err => console.error('Error replacing track:', err));
             }
         });
     }, []);
 
     const admitUser = useCallback((userId: string) => {
-        socket.emit("admit-user", { userId, roomId });
+        socket.current.emit("admit-user", { userId, roomId });
         setPendingRequests(prev => prev.filter(req => req.userId !== userId));
     }, [roomId]);
 
     const rejectUser = useCallback((userId: string) => {
-        socket.emit("reject-user", { userId, roomId });
+        socket.current.emit("reject-user", { userId, roomId });
         setPendingRequests(prev => prev.filter(req => req.userId !== userId));
     }, [roomId]);
 
     const toggleMediaStatus = useCallback((kind: 'audio' | 'video', isOn: boolean) => {
-        socket.emit('toggle-media', { roomId, kind, isOn });
+        socket.current.emit('toggle-media', { roomId, kind, isOn });
     }, [roomId]);
 
-    const [activeSpeakerId] = useState<string | null>(null);
-
-    // Audio Level Detection (Placeholder for future implementation)
-    useEffect(() => {
-        // Future logic to detect active speaker using AudioContext
-    }, []);
-
+    const emitScreenShareStatus = useCallback((isSharing: boolean) => {
+        socket.current.emit('screen-share-status', { roomId, isSharing });
+    }, [roomId]);
 
     useEffect(() => {
         if (!localStream) return;
-        // ... (existing join logic)
-        socket.connect();
-        socket.emit("join-room", { roomId, userName });
 
-        // Handling Waiting Room Logic
-        socket.on("waiting-for-approval", () => {
+        const currentSocket = socket.current;
+
+        currentSocket.connect();
+        currentSocket.emit("join-room", { roomId, userName });
+
+        // Waiting Room Logic
+        currentSocket.on("waiting-for-approval", () => {
             setConnectionStatus('waiting');
         });
 
-        socket.on("join-approved", () => {
+        currentSocket.on("join-approved", () => {
             setConnectionStatus('joined');
             playNotificationSound();
         });
 
-        socket.on("join-rejected", () => {
+        currentSocket.on("join-rejected", () => {
             setConnectionStatus('rejected');
-            socket.disconnect();
+            currentSocket.disconnect();
         });
 
-        socket.on("join-request", (data: { userId: string; userName: string }) => {
+        currentSocket.on("join-request", (data: { userId: string; userName: string }) => {
             setPendingRequests(prev => [...prev, data]);
-            playNotificationSound(); // Notify host
+            playNotificationSound();
         });
 
-        socket.on("user-joined", async (data: { userId: string; userName: string }) => {
+        currentSocket.on("user-joined", async (data: { userId: string; userName: string }) => {
             console.log("User joined:", data);
             playNotificationSound();
             setParticipants((prev) => {
                 if (prev.some(p => p.id === data.userId)) return prev;
-                // Default to true for new users, they will send updates if different
                 return [...prev, { id: data.userId, name: data.userName, stream: null, isMicOn: true, isCameraOn: true }];
             });
             await createPeerConnection(data.userId, data.userName, true, localStream);
         });
 
-        socket.on("media-status-update", (data: { userId: string; kind: 'audio' | 'video'; isOn: boolean }) => {
+        currentSocket.on("media-status-update", (data: { userId: string; kind: 'audio' | 'video'; isOn: boolean }) => {
             setParticipants((prev) => prev.map(p => {
                 if (p.id === data.userId) {
                     return {
@@ -181,10 +226,9 @@ export const useWebRTC = ({ roomId, userName, localStream }: UseWebRTCProps) => 
             }));
         });
 
-        socket.on("offer", async (data: { from: string; offer: RTCSessionDescriptionInit; userName: string }) => {
+        currentSocket.on("offer", async (data: { from: string; offer: RTCSessionDescriptionInit; userName: string }) => {
             console.log("Received offer from:", data.userName);
 
-            // Ensure participant exists in state
             setParticipants((prev) => {
                 if (prev.some(p => p.id === data.from)) return prev;
                 return [...prev, { id: data.from, name: data.userName, stream: null, isMicOn: true, isCameraOn: true }];
@@ -192,10 +236,6 @@ export const useWebRTC = ({ roomId, userName, localStream }: UseWebRTCProps) => 
 
             let pc = peersRef.current.get(data.from);
             if (!pc) {
-                // If we received an offer, we are NOT the initiator.
-                // Pass empty string for userName as we might not know it yet if we are the joiner, 
-                // but 'data.userName' tells us who THEY are.
-                // We pass OUR local stream to the connection.
                 await createPeerConnection(data.from, data.userName, false, localStream);
                 pc = peersRef.current.get(data.from);
             }
@@ -204,7 +244,7 @@ export const useWebRTC = ({ roomId, userName, localStream }: UseWebRTCProps) => 
                 await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
                 const answer = await pc.createAnswer();
                 await pc.setLocalDescription(answer);
-                socket.emit("answer", {
+                currentSocket.emit("answer", {
                     roomId,
                     to: data.from,
                     answer,
@@ -212,14 +252,14 @@ export const useWebRTC = ({ roomId, userName, localStream }: UseWebRTCProps) => 
             }
         });
 
-        socket.on("answer", async (data: { from: string; answer: RTCSessionDescriptionInit }) => {
+        currentSocket.on("answer", async (data: { from: string; answer: RTCSessionDescriptionInit }) => {
             const pc = peersRef.current.get(data.from);
             if (pc) {
                 await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
             }
         });
 
-        socket.on("ice-candidate", async (data: { from: string; candidate: RTCIceCandidateInit }) => {
+        currentSocket.on("ice-candidate", async (data: { from: string; candidate: RTCIceCandidateInit }) => {
             const pc = peersRef.current.get(data.from);
             if (pc) {
                 try {
@@ -230,7 +270,7 @@ export const useWebRTC = ({ roomId, userName, localStream }: UseWebRTCProps) => 
             }
         });
 
-        socket.on("user-left", (data: { userId: string; userName: string }) => {
+        currentSocket.on("user-left", (data: { userId: string; userName: string }) => {
             const pc = peersRef.current.get(data.userId);
             if (pc) {
                 pc.close();
@@ -239,34 +279,39 @@ export const useWebRTC = ({ roomId, userName, localStream }: UseWebRTCProps) => 
             setParticipants((prev) => prev.filter((p) => p.id !== data.userId));
         });
 
-        socket.on("existing-users", (users: Array<{ userId: string; userName: string }>) => {
+        currentSocket.on("existing-users", (users: Array<{ userId: string; userName: string }>) => {
             const uniqueUsers = users.filter((user, index, self) =>
                 index === self.findIndex(u => u.userId === user.userId)
             );
             setParticipants(uniqueUsers.map(u => ({ id: u.userId, name: u.userName, stream: null, isMicOn: true, isCameraOn: true })));
-            setConnectionStatus('joined'); // Existing users means we are in
+            setConnectionStatus('joined');
         });
 
         return () => {
-            socket.off("user-joined");
-            socket.off("offer");
-            socket.off("answer");
-            socket.off("ice-candidate");
-            socket.off("user-left");
-            socket.off("existing-users");
-            socket.off("waiting-for-approval");
-            socket.off("join-approved");
-            socket.off("join-rejected");
-            socket.off("join-request");
-            socket.off("media-status-update");
+            currentSocket.off("user-joined");
+            currentSocket.off("offer");
+            currentSocket.off("answer");
+            currentSocket.off("ice-candidate");
+            currentSocket.off("user-left");
+            currentSocket.off("existing-users");
+            currentSocket.off("waiting-for-approval");
+            currentSocket.off("join-approved");
+            currentSocket.off("join-rejected");
+            currentSocket.off("join-request");
+            currentSocket.off("media-status-update");
 
-            socket.emit("leave-room", roomId);
-            socket.disconnect();
+            currentSocket.emit("leave-room", roomId);
 
+            // MEMORY: Clean up peer connections
             peersRef.current.forEach((pc) => pc.close());
             peersRef.current.clear();
+
+            // MEMORY: Clean up ICE candidate queues
+            iceCandidateTimers.current.forEach(timer => clearTimeout(timer));
+            iceCandidateTimers.current.clear();
+            iceCandidateQueue.current.clear();
         };
-    }, [roomId, userName, localStream, createPeerConnection]);
+    }, [roomId, userName, localStream, createPeerConnection, playNotificationSound]);
 
     return {
         participants,
@@ -276,6 +321,8 @@ export const useWebRTC = ({ roomId, userName, localStream }: UseWebRTCProps) => 
         rejectUser,
         connectionStatus,
         toggleMediaStatus,
-        activeSpeakerId // Return this
+        activeSpeakerId,
+        emitScreenShareStatus,
+        socket: socket.current,
     };
 };

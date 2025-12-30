@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 
 export const useMediaStream = () => {
     const [stream, setStream] = useState<MediaStream | null>(null);
@@ -6,8 +6,20 @@ export const useMediaStream = () => {
     const [isCameraOn, setIsCameraOn] = useState(true);
     const [isScreenSharing, setIsScreenSharing] = useState(false);
 
+    // Store the original camera stream to reuse when stopping screen share
+    const cameraStreamRef = useRef<MediaStream | null>(null);
+    const screenStreamRef = useRef<MediaStream | null>(null);
+
     const initializeMedia = useCallback(async () => {
         try {
+            // If we already have a camera stream, return it
+            if (cameraStreamRef.current && cameraStreamRef.current.active) {
+                setStream(cameraStreamRef.current);
+                setIsMicOn(true);
+                setIsCameraOn(true);
+                return cameraStreamRef.current;
+            }
+
             const mediaStream = await navigator.mediaDevices.getUserMedia({
                 audio: {
                     echoCancellation: true,
@@ -19,6 +31,8 @@ export const useMediaStream = () => {
                     height: { ideal: 720 },
                 },
             });
+
+            cameraStreamRef.current = mediaStream;
             setStream(mediaStream);
             setIsMicOn(true);
             setIsCameraOn(true);
@@ -55,12 +69,15 @@ export const useMediaStream = () => {
                 video: true,
                 audio: false,
             });
+
+            screenStreamRef.current = screenStream;
             const screenTrack = screenStream.getVideoTracks()[0];
 
             setIsScreenSharing(true);
 
+            // Handle when user clicks "Stop Sharing" in browser UI
             screenTrack.onended = () => {
-                stopScreenShare();
+                setIsScreenSharing(false);
             };
 
             return screenStream;
@@ -70,19 +87,26 @@ export const useMediaStream = () => {
         }
     }, []);
 
-    const stopScreenShare = useCallback(async () => {
+    const stopScreenShare = useCallback(() => {
+        // Stop the screen sharing track
+        if (screenStreamRef.current) {
+            screenStreamRef.current.getTracks().forEach(track => track.stop());
+            screenStreamRef.current = null;
+        }
         setIsScreenSharing(false);
-        // The caller of this hook is responsible for reverting the stream to the camera
-        // because this hook manages local state, but replacing tracks involves more logic
-        // We will handle the track replacement in the consumer or extend this hook if needed.
-        // For now, let's just update the state.
+    }, []);
+
+    const getCameraVideoTrack = useCallback(() => {
+        return cameraStreamRef.current?.getVideoTracks()[0] || null;
     }, []);
 
     useEffect(() => {
         return () => {
-            stream?.getTracks().forEach(track => track.stop());
+            // Cleanup all tracks on unmount
+            cameraStreamRef.current?.getTracks().forEach(track => track.stop());
+            screenStreamRef.current?.getTracks().forEach(track => track.stop());
         };
-    }, [stream]);
+    }, []);
 
     return {
         stream,
@@ -94,6 +118,7 @@ export const useMediaStream = () => {
         toggleCamera,
         startScreenShare,
         stopScreenShare,
-        setStream, // Allow external updates (e.g. when switching back from screen share)
+        getCameraVideoTrack, // New method to get the original camera track
+        cameraStream: cameraStreamRef.current, // Expose camera stream
     };
 };
